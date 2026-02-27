@@ -742,7 +742,6 @@ void VerifyFlare(BODY *body,
                  UPDATE *update,
                  int iBody,
                  int iModule) {
-  int iFile = iBody + 1;
   /* Mass must be in proper range */
 
   if (body[iBody].dMass < MINMASSFLARE * MSUN ||
@@ -753,6 +752,46 @@ void VerifyFlare(BODY *body,
             MINMASSFLARE,
             MAXMASSFLARE);
     LineExit(files->Infile[iBody + 1].cIn, options[OPT_MASS].iLine[iBody + 1]);
+  }
+
+  if (body[iBody].iFlareFFD == FLARE_FFD_DAVENPORT ||
+      body[iBody].iFlareFFD == FLARE_FFD_LACY) {
+    if (body[iBody].dAge <= 0) {
+      fprintf(stderr,
+              "ERROR: %s must be > 0 for flare FFD calculations.\n",
+              options[OPT_AGE].cName);
+      LineExit(files->Infile[iBody + 1].cIn, options[OPT_AGE].iLine[iBody + 1]);
+    }
+
+    if (body[iBody].iEnergyBin <= 0) {
+      fprintf(stderr,
+              "ERROR: %s must be > 0 for flare FFD calculations.\n",
+              options[OPT_FLAREENERGYBIN].cName);
+      LineExit(files->Infile[iBody + 1].cIn,
+               options[OPT_FLAREENERGYBIN].iLine[iBody + 1]);
+    }
+
+    if (body[iBody].dFlareMinEnergy <= 0 || body[iBody].dFlareMaxEnergy <= 0) {
+      fprintf(stderr,
+              "ERROR: %s and %s must be > 0.\n",
+              options[OPT_FLAREMINENERGY].cName,
+              options[OPT_FLAREMAXENERGY].cName);
+      if (options[OPT_FLAREMINENERGY].iLine[iBody + 1] >= 0) {
+        LineExit(files->Infile[iBody + 1].cIn,
+                 options[OPT_FLAREMINENERGY].iLine[iBody + 1]);
+      }
+      LineExit(files->Infile[iBody + 1].cIn,
+               options[OPT_FLAREMAXENERGY].iLine[iBody + 1]);
+    }
+
+    if (body[iBody].dFlareMinEnergy >= body[iBody].dFlareMaxEnergy) {
+      fprintf(stderr,
+              "ERROR: %s must be smaller than %s.\n",
+              options[OPT_FLAREMINENERGY].cName,
+              options[OPT_FLAREMAXENERGY].cName);
+      LineExit(files->Infile[iBody + 1].cIn,
+               options[OPT_FLAREMAXENERGY].iLine[iBody + 1]);
+    }
   }
 
 
@@ -1622,50 +1661,55 @@ double fdBandPassKepler(BODY *body, int iBody, double dInputEnergy) {
 }
 
 
-// Davenport parameters of a star with mass dStarMass and age dStarAge
+// Davenport et al. (2019), Equation 3 and Table 1 coefficients
+#define DAVENPORT_A1 -0.07
+#define DAVENPORT_A2 0.79
+#define DAVENPORT_A3 -1.06
+#define DAVENPORT_B1 2.01
+#define DAVENPORT_B2 -25.15
+#define DAVENPORT_B3 33.99
+
+static double fdFFDCumulativeRate(double dLogEnergyErg,
+                                  double dSlopeDayErg,
+                                  double dYIntDay) {
+  // Returns cumulative flare frequency in flares/second.
+  return pow(10.0, dSlopeDayErg * dLogEnergyErg + dYIntDay) / DAYSEC;
+}
+
+// Davenport linear coefficient for log(nu/day) = a*log(E/erg) + b.
 double fdDavenport(double dA1, double dA2, double dA3, double dStarAge,
                    double dStarMass) {
-  // Davenport function recives log(ergs) and return log(flare/day)
-  // Calculating the dA and dB parameters with the Lacy et. al 1976
-  // (1976ApJS...30...85L) equation
-  double dA = 0.0;
-  dStarAge  = dStarAge / (YEARSEC * 1.0e6);
-  // Converting dStarAge from seconds to million years
-  // because Davenport et al. 2019 model only accepts Myr.
-  dStarMass = dStarMass /
-              MSUN; // Converting dStarMass from kg to solar mass because the
-                    // Davenport et al. 2019 model only accepts Msun. The
-                    // StarMass is divided by a factor of 1.99e30 (solar mass)
-                    // because when the user define it in vpl.in they give it in
-                    // solar masses, but the code converts it back to kg.
-  dA = ((dA1 * log10(dStarAge)) + dA2 * (dStarMass) + dA3);
+  double dAgeMyr, dMassSolar;
 
-  return dA;
+  dAgeMyr   = dStarAge / (YEARSEC * 1.0e6);
+  dMassSolar = dStarMass / MSUN;
+
+  // VerifyFlare enforces physically valid inputs; these guards avoid NaN.
+  if (dAgeMyr <= 0 || dMassSolar <= 0) {
+    return 0.0;
+  }
+
+  return (dA1 * log10(dAgeMyr)) + (dA2 * dMassSolar) + dA3;
 }
-// fdFFD calculates FFD of the flares. If LACY mode is choosen, them fdFFD has
-// to convert from SI to the units that the equation 3 from Davenport et al.
-// 2019 understand (i.e., flares/day and flares/(day*log10(erg))).
+
+// fdFFD calculates cumulative flare frequency for either FFD mode.
 double fdFFD(BODY *body,
              int iBody,
              double dLogEnergy,
              double dFlareSlope,
              double dFlareYInt) {
-  double dFlareFreq;
-  double dFFD = 0.0;
+  double dSlopeDayErg, dYIntDay;
 
+  dSlopeDayErg = dFlareSlope;
+  dYIntDay     = dFlareYInt;
+
+  // LACY inputs are stored in SI-like units and converted here.
   if (body[iBody].iFlareFFD == FLARE_FFD_LACY) {
-    dFlareSlope = -dFlareSlope * DAYSEC *
-                  log10(1.0e7); // Converting the slopes from SI units to day
-                                // and "log10(erg)" units.
-    dFlareYInt = dFlareYInt * DAYSEC;
+    dSlopeDayErg = -dFlareSlope * DAYSEC * log10(1.0e7);
+    dYIntDay     = dFlareYInt * DAYSEC;
   }
 
-  dFlareFreq = (dFlareSlope * dLogEnergy) +
-               (dFlareYInt); // Here the Flare frequency are in log(flares/day).
-  dFFD = pow(10, dFlareFreq); // Here the Flare frequency are in flares/day.
-  dFFD = dFFD / DAYSEC;       // Here the Flare frequency are in flares/second.
-
-  return dFFD;
+  return fdFFDCumulativeRate(dLogEnergy, dSlopeDayErg, dYIntDay);
 }
 
 double fdEnergyJoulesXUV(double dLogEnergyXUV) {
@@ -1680,29 +1724,19 @@ double fdEnergyJoulesXUV(double dLogEnergyXUV) {
 double fdLXUVFlare(BODY *body, double dDeltaTime, int iBody) {
   double dFlareSlope = 0.0;
   double dFlareYInt  = 0.0;
-  double dStarAge, dStarMass;
   double dLXUVFlare = 0.0;
-  double dLogEnergyMinERG, dLogEnergyMaxERG, dEnergyMin, dEnergyMax,
-        dLogEnergyMin, dLogEnergyMax;
-  int i, iLogEnergyMinERG, iLogEnergyMaxERG, iLogEnergyMin, iLogEnergyMax;
-  double dEnergyMinXUV, dEnergyMaxXUV, dLogEnergyMinXUV;
-  int iLogEnergyMinERGXUV, iLogEnergyMaxERGXUV, iLogEnergyMinXUV,
-        iLogEnergyMaxXUV;
-  double dEnergyStep, dEnergyStepXUV;
+  double dLogEnergyMinERG, dLogEnergyMaxERG, dLogEnergyMin, dLogEnergyMax;
+  double dLogEnergyMinXUV, dEnergyStep;
+  int i;
 
-
-  // ######################### 1. Choosing how to calculate FFD: slopes(age) or
-  //  slopes(constant)?##################################
+  (void)dDeltaTime;
 
   if (body[iBody].iFlareFFD == FLARE_FFD_DAVENPORT) {
-    // The coefficient values given here were given by Dr. James Davenport in
-    // private comunication
-    dFlareSlope =
-          fdDavenport(-0.07, 0.79, -1.06, body[iBody].dAge,
-                      body[iBody].dMass); //(-0.07054598,0.81225239,-1.07054511)
-    dFlareYInt = fdDavenport(
-          2.01, -25.15, 33.99, body[iBody].dAge,
-          body[iBody].dMass); //(2.06012734,-25.79885288,34.44115635)
+    // Davenport et al. (2019), Eq. 3, Table 1.
+    dFlareSlope = fdDavenport(DAVENPORT_A1, DAVENPORT_A2, DAVENPORT_A3,
+                              body[iBody].dAge, body[iBody].dMass);
+    dFlareYInt = fdDavenport(DAVENPORT_B1, DAVENPORT_B2, DAVENPORT_B3,
+                             body[iBody].dAge, body[iBody].dMass);
   } else if (body[iBody].iFlareFFD == FLARE_FFD_LACY) {
     dFlareSlope = body[iBody].dFlareSlope;
     dFlareYInt  = body[iBody].dFlareYInt;
@@ -1712,107 +1746,57 @@ double fdLXUVFlare(BODY *body, double dDeltaTime, int iBody) {
     dFlareSlopeErrorLower = body[iBody].dFlareSlopeErrorLower;
     dFlareYIntErrorUpper = body[iBody].dFlareYIntErrorUpper;
     dFlareYIntErrorLower = body[iBody].dFlareYIntErrorLower;*/
+  } else if (body[iBody].iFlareFFD == FLARE_FFD_NONE) {
+    return body[iBody].dLXUVFlareConst;
+  } else {
+    return 0.0;
   }
-  if (body[iBody].iFlareFFD == FLARE_FFD_DAVENPORT ||
-      body[iBody].iFlareFFD == FLARE_FFD_LACY) {
-    // ################# 2. Calculating the XUV energy (SXR 1.24 - 1239.85
-    // Å)#######################################################
 
-    dLogEnergyMinXUV = fdBandPassXUV(body, iBody, body[iBody].dFlareMinEnergy);
+  // 1. Convert the user-selected energy limits to XUV and Kepler spaces.
+  dLogEnergyMinXUV = fdBandPassXUV(body, iBody, body[iBody].dFlareMinEnergy);
+  dLogEnergyMin    = fdBandPassKepler(body, iBody, body[iBody].dFlareMinEnergy);
+  dLogEnergyMax    = fdBandPassKepler(body, iBody, body[iBody].dFlareMaxEnergy);
 
-    // Declaring the XUV Energy arrays of size dEnergyBin
-    // double daEnergyJOUXUV[iEnergyBin + 1], daLogEnerXUV[iEnergyBin + 1],
-    //      daEnergyERGXUV[iEnergyBin + 1];
+  // Davenport uses log10(E/erg), so convert Joules -> ergs in log-space.
+  dLogEnergyMinERG = dLogEnergyMin + 7.0;
+  dLogEnergyMaxERG = dLogEnergyMax + 7.0;
+  dEnergyStep      = (dLogEnergyMaxERG - dLogEnergyMinERG) / body[iBody].iEnergyBin;
 
-    // ################# 3. Calculating the energy in the Kepler band pass (4000
-    // – 9000 Å) ##############################################
-
-    dLogEnergyMin = fdBandPassKepler(body, iBody, body[iBody].dFlareMinEnergy);
-    dLogEnergyMax = fdBandPassKepler(body, iBody, body[iBody].dFlareMaxEnergy);
-
-    // 1.0 J = 1.0e7 ergs, but this is in log, so we have to sum 7.0, not
-    // multiply by 1.0e7 Convert the units of the energy from Joules to ergs
-    // because Davenport et al. 2019 model only accepts energy in ergs.
-
-    dLogEnergyMinERG = dLogEnergyMin + 7.0;
-    dLogEnergyMaxERG = dLogEnergyMax + 7.0;
-
-    // Defining the energy step used in line 1097, 1099, and 1101 to fill the
-    // energy arrays
-    dEnergyStep = (dLogEnergyMaxERG - dLogEnergyMinERG) / body[iBody].iEnergyBin;
-
-    // Declaring the Kepler Energy arrays of size iEnergyBin
-    // double daEnergyERG[iEnergyBin + 1], daEnergyJOU[iEnergyBin + 1],
-    //      daLogEner[iEnergyBin + 1], daEnerJOU[iEnergyBin + 1];
-
-    // ############################ 4. Filling the energy arrays
-    // ########################################################################
-
-    for (i = 0; i < body[iBody].iEnergyBin + 1; i++) {
-      // XUV energy (energy_joules)
-      body[iBody].daEnergyJOUXUV[i] =
-            fdEnergyJoulesXUV(dLogEnergyMinXUV + i * dEnergyStep);
-      // Kepler energy (log(energy_ergs))
-      body[iBody].daLogEner[i] = dLogEnergyMinERG + i * dEnergyStep;
-      // Kepler energy (energy_joules)
-      body[iBody].daEnerJOU[i] = pow(10, (dLogEnergyMin + i * dEnergyStep));
-    }
-
-    body[iBody].dFlareEnergy1   = body[iBody].daEnerJOU[0];
-    body[iBody].dFlareEnergy2   = body[iBody].daEnerJOU[1];
-    body[iBody].dFlareEnergy3   = body[iBody].daEnerJOU[2];
-    body[iBody].dFlareEnergy4   = body[iBody].daEnerJOU[3];
-    body[iBody].dFlareEnergyMin = body[iBody].daEnerJOU[0];
-    body[iBody].dFlareEnergyMid = body[iBody].daEnerJOU[(int)(body[iBody].iEnergyBin / 2.)];
-    body[iBody].dFlareEnergyMax = body[iBody].daEnerJOU[body[iBody].iEnergyBin];
-    // ############################ 5. Filling the FFD arrays
-    // ########################################################################
-
-    // Declaring the Flare Frequency distribution (FFD) arrays of size
-    // dEnergyBin
-    // double daFFD[iEnergyBin + 1];
-
-    // When DAVENPORT or LACY are selected, we have to calculate the FFD first.
-    for (i = 0; i < body[iBody].iEnergyBin + 1; i++) {
-      body[iBody].daFFD[i] = fdFFD(body, iBody, body[iBody].daLogEner[i],
-                                   dFlareSlope, dFlareYInt);
-    }
-
-    body[iBody].dFlareFreq1   = body[iBody].daFFD[0];
-    body[iBody].dFlareFreq2   = body[iBody].daFFD[1];
-    body[iBody].dFlareFreq3   = body[iBody].daFFD[2];
-    body[iBody].dFlareFreq4   = body[iBody].daFFD[3];
-    body[iBody].dFlareFreqMin = body[iBody].daFFD[0];
-    body[iBody].dFlareFreqMid = body[iBody].daFFD[(int)(body[iBody].iEnergyBin / 2)];
-    body[iBody].dFlareFreqMax = body[iBody].daFFD[body[iBody].iEnergyBin];
-    // ############################ 6. Calculating the XUV luminosity by flares
-    // ########################################################################
-    //  double daLXUVFlare[iEnergyBin];
-
-    // Calculating the luminosity by flares for DAVENPORT or LACY mode
-    // if the user select to calculate the luminosity using a FFD model
-    for (i = 0; i < body[iBody].iEnergyBin; i++) {
-      body[iBody].daLXUVFlare[i] =
-            (body[iBody].daEnergyJOUXUV[i + 1] -
-             body[iBody].daEnergyJOUXUV[i]) *
-            ((body[iBody].daFFD[i + 1] + body[iBody].daFFD[i]) / 2);
-      dLXUVFlare += body[iBody].daLXUVFlare[i];
-    }
+  // 2. Build energy grids.
+  for (i = 0; i < body[iBody].iEnergyBin + 1; i++) {
+    body[iBody].daEnergyJOUXUV[i] = fdEnergyJoulesXUV(dLogEnergyMinXUV + i * dEnergyStep);
+    body[iBody].daLogEner[i]      = dLogEnergyMinERG + i * dEnergyStep;
+    body[iBody].daEnerJOU[i]      = pow(10, dLogEnergyMin + i * dEnergyStep);
   }
-  // If the FFD model is set to NONE, the luminosity remains constant over the
-  // time evolution of the system and receives the value given by the user in
-  // the input file
-  else if (body[iBody].iFlareFFD == FLARE_FFD_NONE) {
-    dLXUVFlare = 0.0;
-    dLXUVFlare = body[iBody].dLXUVFlareConst;
+
+  body[iBody].dFlareEnergy1   = body[iBody].daEnerJOU[0];
+  body[iBody].dFlareEnergy2   = body[iBody].daEnerJOU[1];
+  body[iBody].dFlareEnergy3   = body[iBody].daEnerJOU[2];
+  body[iBody].dFlareEnergy4   = body[iBody].daEnerJOU[3];
+  body[iBody].dFlareEnergyMin = body[iBody].daEnerJOU[0];
+  body[iBody].dFlareEnergyMid = body[iBody].daEnerJOU[(int)(body[iBody].iEnergyBin / 2.)];
+  body[iBody].dFlareEnergyMax = body[iBody].daEnerJOU[body[iBody].iEnergyBin];
+
+  // 3. Evaluate cumulative FFD and integrate flare XUV luminosity.
+  for (i = 0; i < body[iBody].iEnergyBin + 1; i++) {
+    body[iBody].daFFD[i] = fdFFD(body, iBody, body[iBody].daLogEner[i],
+                                 dFlareSlope, dFlareYInt);
   }
-  /*  else {
-          for(i = 0; i < iEnergyBin; i++) {
-            daLXUVFlare[i] =
-    (daEnergyJOUXUV[i+1]-daEnergyJOUXUV[i])*((daFFD[i+1] + daFFD[i])/2);
-            dLXUVFlare += daLXUVFlare[i];
-          }
-    }*/
+
+  body[iBody].dFlareFreq1   = body[iBody].daFFD[0];
+  body[iBody].dFlareFreq2   = body[iBody].daFFD[1];
+  body[iBody].dFlareFreq3   = body[iBody].daFFD[2];
+  body[iBody].dFlareFreq4   = body[iBody].daFFD[3];
+  body[iBody].dFlareFreqMin = body[iBody].daFFD[0];
+  body[iBody].dFlareFreqMid = body[iBody].daFFD[(int)(body[iBody].iEnergyBin / 2)];
+  body[iBody].dFlareFreqMax = body[iBody].daFFD[body[iBody].iEnergyBin];
+
+  for (i = 0; i < body[iBody].iEnergyBin; i++) {
+    body[iBody].daLXUVFlare[i] =
+          (body[iBody].daEnergyJOUXUV[i + 1] - body[iBody].daEnergyJOUXUV[i]) *
+          ((body[iBody].daFFD[i + 1] + body[iBody].daFFD[i]) / 2.0);
+    dLXUVFlare += body[iBody].daLXUVFlare[i];
+  }
 
   return dLXUVFlare;
 }
